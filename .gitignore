@@ -1,0 +1,27 @@
+# Virtual environment
+venv/
+.venv/
+
+# PySpark / Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints
+
+# Logs
+*.log
+sensors_pothole.log
+sensors_smooth.log
+sensors_urban.log
+
+# Streamlit config/states
+.streamlit/
+
+# Local databases and spark delta lake data/checkpoints
+data/
+checkpoints/
+
+# OS specific files
+.DS_Store
+Thumbs.db
