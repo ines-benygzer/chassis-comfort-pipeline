@@ -12,18 +12,27 @@ GRAVITY = 9.81  # m/s^2
 # Physics Constraints
 MIN_SPEED = 20.0   # km/h
 MAX_SPEED = 140.0  # km/h
-MAX_ACC_Z = 8.0    # m/s^2 (Higher limit for bumps)
+MAX_ACC_Z = 12.0   # m/s^2 (Accommodates severe dynamic shocks and potholes)
 MAX_SUSP = 80.0    # mm
 MIN_PITCH = -8.0   # deg
 MAX_PITCH = 8.0    # deg
 MIN_ROLL = -6.0    # deg
 MAX_ROLL = 6.0     # deg
 
-# Scenarios with enhanced variability
+# Scenarios with physical road profile parameters (ISO 8608 roughness and transient obstacle dynamics)
 SCENARIOS = {
-    "Run_Smooth_Highway": {"roughness": 0.1, "spike_prob": 0.001, "spike_mag": 0.3},
-    "Run_Urban_Road":     {"roughness": 0.8, "spike_prob": 0.03,  "spike_mag": 2.0},
-    "Run_Pothole_Alley":  {"roughness": 2.0, "spike_prob": 0.15,  "spike_mag": 5.0},
+    "Run_Smooth_Highway": {
+        "target_speed_min": 90.0, "target_speed_max": 130.0,
+        "roughness_g0": 4e-6, "bump_prob": 0.002, "bump_height": 0.008
+    },
+    "Run_Urban_Road": {
+        "target_speed_min": 35.0, "target_speed_max": 65.0,
+        "roughness_g0": 32e-6, "bump_prob": 0.03, "bump_height": 0.030
+    },
+    "Run_Pothole_Alley": {
+        "target_speed_min": 20.0, "target_speed_max": 45.0,
+        "roughness_g0": 128e-6, "bump_prob": 0.12, "bump_height": -0.050
+    },
 }
 
 # Avro Schema for real-time streaming
@@ -46,7 +55,20 @@ AVRO_SCHEMA = """
 """
 
 class VehiclePhysics:
-    """Simulates realistic vehicle chassis dynamics including bumps and road noise."""
+    """
+    Simulates realistic 2-DOF Quarter-Car chassis dynamics.
+    
+    Differential Equations:
+      m_s * d2(z_s)/dt2 = -F_susp
+      m_u * d2(z_u)/dt2 =  F_susp - F_tire
+      
+    Where:
+      - m_s: Sprung mass (chassis body quarter) ~ 320 kg
+      - m_u: Unsprung mass (wheel assembly) ~ 42 kg
+      - F_susp: Spring + Asymmetric Damper + Non-linear bump-stops
+      - F_tire: Tire vertical stiffness + contact damping
+      - Natural frequencies: Body bounce ~ 1.4 Hz, Wheel hop ~ 11.4 Hz
+    """
     def __init__(self, vehicle_id, scenario_name=None):
         self.vehicle_id = vehicle_id
         if scenario_name and scenario_name in SCENARIOS:
@@ -55,71 +77,152 @@ class VehiclePhysics:
             self.scenario_name = random.choice(list(SCENARIOS.keys()))
         
         self.test_id = f"{self.scenario_name}_{datetime.now().strftime('%H%M%S')}"
-        self.scenario_params = SCENARIOS[self.scenario_name]
+        self.params = SCENARIOS[self.scenario_name]
         
-        # State Variables
-        self.speed_kmh = random.uniform(30.0, 60.0)
-        self.target_speed = random.uniform(MIN_SPEED, MAX_SPEED)
-        self.acc_z = 0.0
-        self.suspension_mm = 30.0 
+        # Quarter-Car 2-DOF Physical Parameters
+        self.m_s = 320.0       # Sprung mass (kg)
+        self.m_u = 42.0        # Unsprung mass (kg)
+        self.k_s = 26000.0     # Suspension spring stiffness (N/m)
+        self.c_s_comp = 1100.0 # Compression damping (N*s/m)
+        self.c_s_reb  = 1800.0 # Rebound damping (N*s/m)
+        self.k_t = 190000.0    # Tire vertical stiffness (N/m)
+        self.c_t = 150.0       # Tire damping (N*s/m)
+        
+        # Progressive elastomeric bump-stops
+        self.bump_stop_clearance = 0.035 # 35 mm stroke before progressive stop engagement
+        self.k_bump_stop = 80000.0       # Progressive spring rate
+        
+        # State variables (relative to static equilibrium)
+        self.z_s = 0.0         # Sprung mass vertical displacement (m)
+        self.v_s = 0.0         # Sprung mass vertical velocity (m/s)
+        self.acc_z = 0.0       # Sprung mass vertical acceleration (m/s^2)
+        
+        self.z_u = 0.0         # Unsprung mass vertical displacement (m)
+        self.v_u = 0.0         # Unsprung mass vertical velocity (m/s)
+        
+        self.z_r = 0.0         # Road elevation profile (m)
+        self.road_profile_x = 0.0 # Spatial distance along test route (m)
+        
+        # Speed dynamics
+        self.speed_kmh = random.uniform(self.params["target_speed_min"], self.params["target_speed_max"])
+        self.target_speed = self.speed_kmh
+        self.speed_timer = 0.0
+        self.long_acc = 0.0    # Longitudinal acceleration (m/s^2)
+        
+        # Suspension sensor reading
+        self.suspension_mm = 35.0 # Nominal resting height
+        
+        # Chassis posture (degrees)
         self.pitch_deg = 0.0
         self.roll_deg = 0.0
-        
-        self.speed_change_timer = 0
         self.roll_phase = random.uniform(0, 2 * math.pi)
+        
+        # Active transient obstacle (bump / pothole / seam)
+        self.active_obstacle = None
         
     def set_scenario(self, scenario_name):
         if scenario_name in SCENARIOS:
             self.scenario_name = scenario_name
-            self.scenario_params = SCENARIOS[scenario_name]
+            self.params = SCENARIOS[scenario_name]
 
     def update(self, dt):
-        """Calculates the next physics state based on dt (delta time)."""
-        
-        # 1. Speed Dynamics (Slowly drifting target)
-        self.speed_change_timer += dt
-        if self.speed_change_timer > 8.0:
-            self.target_speed = random.uniform(MIN_SPEED, MAX_SPEED)
-            self.speed_change_timer = 0
-        
-        speed_delta = (self.target_speed - self.speed_kmh) * dt * 0.2
+        """Advances vehicle dynamics using high-frequency numerical sub-stepping."""
+        # 1. Longitudinal speed dynamics
+        self.speed_timer += dt
+        if self.speed_timer > 6.0:
+            self.target_speed = random.uniform(self.params["target_speed_min"], self.params["target_speed_max"])
+            self.speed_timer = 0.0
+            
+        speed_error = (self.target_speed - self.speed_kmh)
+        speed_delta = speed_error * dt * 0.25
+        self.long_acc = (speed_delta / 3.6) / dt # m/s^2
         self.speed_kmh += speed_delta
         self.speed_kmh = max(MIN_SPEED, min(self.speed_kmh, MAX_SPEED))
-
-        # 2. Road Excitation (Vibration)
-        speed_factor = (self.speed_kmh / 100.0) # Higher speed = more vibration
-        roughness = self.scenario_params["roughness"]
+        v_ms = self.speed_kmh / 3.6
         
-        # Base Road Noise (Gaussian)
-        base_noise = random.gauss(0, 0.4) * roughness * speed_factor
+        # 2. Transient obstacle trigger (Speed bumps, potholes, expansion seams)
+        if self.active_obstacle is None:
+            if random.random() < (self.params["bump_prob"] * (dt * 20.0)):
+                h = self.params["bump_height"] * random.uniform(0.8, 1.4)
+                length = random.uniform(0.6, 1.2) if h > 0 else random.uniform(0.4, 0.8)
+                self.active_obstacle = {
+                    "start_x": self.road_profile_x,
+                    "length": length,
+                    "height": h
+                }
+                
+        # 3. High-frequency Sub-stepping for 2-DOF numerical integration (400 Hz solver)
+        sub_steps = 20
+        h_step = dt / sub_steps
         
-        # ⚠️ BUMP GENERATOR (Spikes)
-        bump_noise = 0.0
-        if random.random() < (self.scenario_params["spike_prob"]):
-            # Generate a "Shock" event
-            impact_mag = self.scenario_params["spike_mag"] * random.uniform(0.7, 1.5)
-            # Randomly either a pothole (negative) or a bump (positive)
-            bump_noise = random.choice([-1, 1]) * impact_mag
+        for _ in range(sub_steps):
+            dx = v_ms * h_step
+            self.road_profile_x += dx
+            
+            # Base ISO 8608 Roughness (1st order filtered spatial white noise)
+            g0 = self.params["roughness_g0"]
+            noise_std = math.sqrt(2 * math.pi * g0 * max(1.0, v_ms) / h_step)
+            road_white_noise = random.gauss(0, 1.0) * noise_std * 0.015
+            self.z_r += -2 * math.pi * 0.1 * self.z_r * h_step + road_white_noise * h_step
+            
+            # Add active obstacle profile (Half-sine wave)
+            obstacle_z = 0.0
+            if self.active_obstacle:
+                rel_x = self.road_profile_x - self.active_obstacle["start_x"]
+                l_obs = self.active_obstacle["length"]
+                if 0 <= rel_x <= l_obs:
+                    obstacle_z = self.active_obstacle["height"] * math.sin(math.pi * rel_x / l_obs)
+                else:
+                    self.active_obstacle = None
+                    
+            z_road_total = self.z_r + obstacle_z
+            
+            # Quarter-Car forces
+            delta_z = self.z_s - self.z_u
+            v_rel = self.v_s - self.v_u
+            
+            # Asymmetric damping (rebound stiffer than compression)
+            c_damper = self.c_s_reb if v_rel > 0 else self.c_s_comp
+            f_damper = c_damper * v_rel
+            f_spring = self.k_s * delta_z
+            
+            # Non-linear bump-stop force
+            f_bump_stop = 0.0
+            excess_jounce = abs(delta_z) - self.bump_stop_clearance
+            if excess_jounce > 0:
+                f_bump_stop = math.copysign(self.k_bump_stop * (excess_jounce ** 2), delta_z)
+                
+            f_suspension = f_spring + f_damper + f_bump_stop
+            
+            # Tire dynamic vertical force
+            tire_deflection = self.z_u - z_road_total
+            f_tire = max(0.0, self.k_t * (tire_deflection + 0.02) + self.c_t * self.v_u) - (self.k_t * 0.02)
+            
+            # Accelerations (Newton's 2nd Law)
+            a_sprung = -f_suspension / self.m_s
+            a_unsprung = (f_suspension - f_tire) / self.m_u
+            
+            # Symplectic Euler integration
+            self.v_s += a_sprung * h_step
+            self.z_s += self.v_s * h_step
+            self.v_u += a_unsprung * h_step
+            self.z_u += self.v_u * h_step
+            
+        self.acc_z = max(-MAX_ACC_Z, min(MAX_ACC_Z, a_sprung))
         
-        # Combine noise and bumps
-        self.acc_z = base_noise + bump_noise
-        # Limit to physical maximums
-        self.acc_z = max(-MAX_ACC_Z, min(self.acc_z, MAX_ACC_Z))
+        # 4. Suspension Stroke (Nominal 35mm at equilibrium)
+        susp_disp = (self.z_u - self.z_s) * 1000.0 # mm
+        self.suspension_mm = max(5.0, min(MAX_SUSP, 35.0 + susp_disp))
         
-        # 3. Suspension Response
-        # Suspension dampens the acceleration
-        target_susp = 35.0 + (self.acc_z * 8.0) + random.gauss(0, 0.5)
-        self.suspension_mm += (target_susp - self.suspension_mm) * dt * 12.0
-        self.suspension_mm = max(0.0, min(self.suspension_mm, MAX_SUSP))
-
-        # 4. Chassis Orientation (Pitch/Roll)
-        # Pitch reacts to speed changes
-        target_pitch = speed_delta * 10.0 + (self.acc_z * 0.5)
-        self.pitch_deg += (target_pitch - self.pitch_deg) * dt * 4.0
+        # 5. Chassis Posture: Pitch & Roll Dynamics
+        target_pitch = (self.long_acc * 1.8) + (self.acc_z * 0.25)
+        self.pitch_deg += (target_pitch - self.pitch_deg) * dt * 5.0
+        self.pitch_deg = max(MIN_PITCH, min(MAX_PITCH, self.pitch_deg))
         
-        # Roll simulates highway curves
-        self.roll_phase += dt * 0.1
-        self.roll_deg = math.sin(self.roll_phase) * 2.0 * speed_factor + random.gauss(0, 0.1)
+        self.roll_phase += dt * (v_ms / 30.0)
+        target_roll = math.sin(self.roll_phase) * 1.5 * (self.speed_kmh / 100.0) + (self.z_s * 15.0)
+        self.roll_deg += (target_roll - self.roll_deg) * dt * 3.0
+        self.roll_deg = max(MIN_ROLL, min(MAX_ROLL, self.roll_deg))
 
     def generate_message(self):
         """Formats the current state into an Avro-ready dictionary."""

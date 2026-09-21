@@ -170,7 +170,7 @@ def main():
     silver_cleaned = silver_parsed \
         .filter(col("vehicle_id").isNotNull()) \
         .filter(col("acc_z").isNotNull()) \
-        .filter(col("acc_z").between(-5.0, 5.0)) \
+        .filter(col("acc_z").between(-15.0, 15.0)) \
         .filter(col("speed_kmh") >= 0) \
         .withColumn("event_time", to_timestamp(col("timestamp"))) \
         .withColumn("year", year(col("event_time"))) \

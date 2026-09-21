@@ -9,7 +9,7 @@ In vehicle validation, individual driver preferences lead to inconsistent comfor
 
 ### Architecture & Processing Pipeline
 
-* **Ingestion:** Telemetry producer generating 20 Hz vehicle dynamic states across standard test scenarios (highway, urban, pothole). Messages are serialized with Apache Avro and registered against Confluent Schema Registry.
+* **Ingestion (2-DOF Quarter-Car Dynamics):** Physics-based simulation modeling sprung mass ($m_s \approx 320\text{ kg}$), unsprung wheel mass ($m_u \approx 42\text{ kg}$), suspension stiffness with progressive elastomeric bump stops, asymmetric damping, tire compliance, and ISO 8608 road roughness. Integrated via a 400 Hz numerical solver emitting 20 Hz Avro telemetry registered with Confluent Schema Registry.
 * **Storage & Medallion Layers (Delta Lake):**
   * **Bronze:** Raw streaming Kafka records stored with ingestion timestamps.
   * **Silver:** Parsed, validated, and structured records partitioned by vehicle and date.
