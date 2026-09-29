@@ -82,7 +82,8 @@ AVRO_SCHEMA = """
     {"name": "acc_z", "type": "double"},
     {"name": "suspension_mm", "type": "double"},
     {"name": "pitch_deg", "type": "double"},
-    {"name": "roll_deg", "type": "double"}
+    {"name": "roll_deg", "type": "double"},
+    {"name": "tire_load_ratio", "type": "double", "default": 1.0}
   ]
 }
 """
@@ -150,6 +151,10 @@ class VehiclePhysics:
         
         # Suspension sensor reading
         self.suspension_mm = 35.0 # Nominal resting height
+        
+        # Tire Normal Force & Road-Holding
+        self.f_static = (self.m_s + self.m_u) * GRAVITY
+        self.tire_load_ratio = 1.0
         
         # Chassis posture (degrees)
         self.pitch_deg = 0.0
@@ -261,6 +266,12 @@ class VehiclePhysics:
         susp_disp = (self.z_u - self.z_s) * 1000.0 # mm
         self.suspension_mm = max(5.0, min(MAX_SUSP, 35.0 + susp_disp))
         
+        # Dynamic Tire Normal Force & Road-Holding Ratio:
+        # F_normal = max(0, F_static - f_tire)
+        # eta = F_normal / F_static. eta < 0.15 indicates imminent wheel lift-off hazard!
+        f_normal = max(0.0, self.f_static - f_tire)
+        self.tire_load_ratio = float(max(0.0, min(3.5, f_normal / self.f_static)))
+        
         # 5. Chassis Posture: Pitch & Roll Dynamics
         target_pitch = (self.long_acc * 1.8) + (self.acc_z * 0.25)
         self.pitch_deg += (target_pitch - self.pitch_deg) * dt * 5.0
@@ -281,7 +292,8 @@ class VehiclePhysics:
             "acc_z": float(round(self.acc_z, 4)),
             "suspension_mm": float(round(self.suspension_mm, 2)),
             "pitch_deg": float(round(self.pitch_deg, 3)),
-            "roll_deg": float(round(self.roll_deg, 3))
+            "roll_deg": float(round(self.roll_deg, 3)),
+            "tire_load_ratio": float(round(self.tire_load_ratio, 4))
         }
 
 def run_simulation(args):

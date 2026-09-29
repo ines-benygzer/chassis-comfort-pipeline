@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, window, expr, sqrt, avg, max as spark_max, abs as spark_abs, 
+    col, window, expr, sqrt, avg, max as spark_max, min as spark_min, abs as spark_abs, 
     current_timestamp, to_timestamp, to_date, year, month, day, 
     collect_list, pandas_udf, udf
 )
