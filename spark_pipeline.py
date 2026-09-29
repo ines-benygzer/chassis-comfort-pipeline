@@ -5,7 +5,7 @@ import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, window, expr, sqrt, avg, max as spark_max, abs as spark_abs, 
-    current_timestamp, to_timestamp, year, month, day, 
+    current_timestamp, to_timestamp, to_date, year, month, day, 
     collect_list, pandas_udf, udf
 )
 from pyspark.sql.types import (
@@ -71,47 +71,84 @@ def main():
         .config("spark.sql.shuffle.partitions", "2") \
         .getOrCreate()
 
-    # --- ISO 2631-1 WEIGHTED ACCELERATION (STANDARD UDF) ---
-    @udf(DoubleType())
-    def calculate_iso_weighted_acc(acc_z_list):
+    # --- ISO 2631-1 MULTI-METRIC COMFORT & SHOCK EVALUATION (UDF) ---
+    iso_metrics_schema = StructType([
+        StructField("weighted_acc_z", DoubleType(), False),
+        StructField("vdv_acc_z", DoubleType(), False),
+        StructField("crest_factor", DoubleType(), False),
+        StructField("dominant_freq", DoubleType(), False),
+        StructField("shock_event", StringType(), False),
+        StructField("iso_comfort_tier", StringType(), False),
+    ])
+
+    @udf(iso_metrics_schema)
+    def calculate_iso_comfort_metrics(acc_z_list):
         """
-        Computes ISO 2631-1 frequency-weighted acceleration (Wk curve).
+        Computes ISO 2631-1 multi-dimensional vibration and shock comfort metrics:
+          1. Continuous Vibration: Wk frequency-weighted RMS acceleration (aw) via FFT.
+          2. Transient Shock: Vibration Dose Value (VDV) using 4th-power time integration.
+          3. Crest Factor: Peak / RMS ratio (when CF > 9, standard RMS is invalid and VDV governs).
+          4. Dominant Frequency: Frequency of maximum spectral energy.
+          5. Qualitative Comfort Scale: Official ISO 2631-1:1997 Annex C rating.
         """
+        default_res = (0.0, 0.0, 1.0, 0.0, "NOMINAL", "Comfortable")
         try:
-            if acc_z_list is None or len(acc_z_list) < 2:
-                return 0.0
+            if acc_z_list is None or len(acc_z_list) < 4:
+                return default_res
             
-            # Convert to numpy and handle any potential NaNs in the input stream
-            y = np.nan_to_num(np.array(acc_z_list), nan=0.0)
+            y = np.nan_to_num(np.array(acc_z_list, dtype=float), nan=0.0)
             n = len(y)
+            dt = 1.0 / SAMPLING_RATE
             
-            # Remove DC component (detrend)
-            y = y - np.mean(y)
+            # 1. Detrend signal (remove DC acceleration offset)
+            y_detrend = y - np.mean(y)
             
-            # FFT (rfft returns magnitudes for positive frequencies)
-            # Normalize FFT by n to get amplitude-like values for RMS calculation
-            # Use max(1, n/2.0) to avoid division by zero
-            yf = np.abs(np.fft.rfft(y)) / max(1.0, n / 2.0)
-            xf = np.fft.rfftfreq(n, 1/SAMPLING_RATE)
+            # 2. Fourier Transform (rfft)
+            yf = np.fft.rfft(y_detrend)
+            xf = np.fft.rfftfreq(n, dt)
             
-            # Wk Weights (ISO 2631-1 Vertical)
+            # 3. ISO 2631-1 Wk Weighting Curve (Vertical vibration sensitivity, peak at 4-8 Hz)
             freqs = np.array([0.5, 1.0, 2.0, 4.0, 5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0])
             gains = np.array([0.062, 0.176, 0.643, 0.967, 1.000, 0.977, 0.892, 0.776, 0.648, 0.512, 0.409, 0.330, 0.266, 0.215, 0.176, 0.145, 0.119])
-            
-            # Interpolate gains for each FFT bin
             wk_gains = np.interp(xf, freqs, gains, left=0.0, right=0.0)
             
-            # Apply weighting
-            weighted_magnitudes = yf * wk_gains
+            # 4. Filtered signal in frequency and time domain
+            yf_weighted = yf * wk_gains
+            # Inverse FFT to reconstruct exact weighted time history aw(t)
+            aw_t = np.fft.irfft(yf_weighted, n)
             
-            # RMS calculation
-            # User formula: sqrt(mean(weighted_magnitudes**2))
-            # Use nan_to_num again just in case of intermediate overflows
-            weighted_rms = float(np.sqrt(np.mean(np.nan_to_num(weighted_magnitudes**2))))
+            # 5. Continuous Vibration: Weighted RMS aw (m/s^2)
+            weighted_rms = float(np.sqrt(np.mean(aw_t**2)))
             
-            return weighted_rms
+            # 6. Transient Shock: Vibration Dose Value (VDV in m/s^1.75) via 4th-power integral
+            vdv = float((dt * np.sum(aw_t**4))**0.25)
+            
+            # 7. Crest Factor: Peak / RMS ratio (ISO 2631-1 Section 6.3.3: CF > 9 requires VDV)
+            peak_aw = float(np.max(np.abs(aw_t)))
+            crest_factor = float(peak_aw / max(0.001, weighted_rms))
+            shock_event = "SHOCK_DETECTED (CF>9)" if crest_factor > 9.0 else "NOMINAL"
+            
+            # 8. Dominant Frequency (ignoring DC)
+            powers = np.abs(yf)**2
+            dominant_freq = float(xf[np.argmax(powers[1:]) + 1]) if len(powers) > 1 else 0.0
+            
+            # 9. Official ISO 2631-1:1997 Annex C Comfort Classification
+            if weighted_rms < 0.315:
+                comfort_tier = "Comfortable"
+            elif weighted_rms < 0.63:
+                comfort_tier = "A little uncomfortable"
+            elif weighted_rms < 1.0:
+                comfort_tier = "Fairly uncomfortable"
+            elif weighted_rms < 1.6:
+                comfort_tier = "Uncomfortable"
+            elif weighted_rms < 2.5:
+                comfort_tier = "Very uncomfortable"
+            else:
+                comfort_tier = "Extremely uncomfortable"
+                
+            return (weighted_rms, vdv, crest_factor, dominant_freq, shock_event, comfort_tier)
         except Exception:
-            return 0.0
+            return default_res
 
     spark.sparkContext.setLogLevel("WARN")
 
@@ -199,34 +236,50 @@ def main():
             collect_list("acc_z").alias("acc_z_series")
         )
 
-    # Apply ISO Weighted Acceleration UDF
+    # Apply ISO 2631-1 Multi-Metric Comfort Evaluation (FFT + VDV + Crest Factor)
     gold_with_iso = gold_windowed \
-        .withColumn("weighted_acc_z", calculate_iso_weighted_acc(col("acc_z_series"))) \
-        .drop("acc_z_series")
+        .withColumn("iso_metrics", calculate_iso_comfort_metrics(col("acc_z_series"))) \
+        .select("*", "iso_metrics.*") \
+        .drop("iso_metrics", "acc_z_series")
 
-    # Industrial Comfort Score Logic (ISO 2631-1 Based)
-    # Scale: 0-100, where 100 is perfect comfort.
-    # User formula: 100 - weighted_acc_z * 50, clamped 0-100.
+    # Dynamic Comfort Score (0-100%):
+    # Evaluates continuous vibration (weighted_acc_z) and transient shock (vdv_acc_z)
+    # Severe pothole shocks penalize comfort through VDV even if baseline RMS is low
     gold_metrics = gold_with_iso \
         .withColumn("comfort_score", 
-            expr("GREATEST(0.0, LEAST(100.0, 100.0 - (weighted_acc_z * 50.0)))"))
+            expr("GREATEST(0.0, LEAST(100.0, 100.0 - (weighted_acc_z * 40.0 + vdv_acc_z * 12.0)))"))
 
     gold_final = gold_metrics.select(
         col("window.start").alias("start_time"),
         col("window.end").alias("end_time"),
         "vehicle_id", "test_id", "rms_acc_z", "peak_acc_z", 
-        "avg_speed", "weighted_acc_z", "comfort_score"
-    ).withColumn("year", year(col("start_time"))) \
+        "avg_speed", "weighted_acc_z", "vdv_acc_z", "crest_factor",
+        "dominant_freq", "shock_event", "iso_comfort_tier", "comfort_score"
+    ).withColumn("date", to_date(col("start_time"))) \
+     .withColumn("year", year(col("start_time"))) \
      .withColumn("month", month(col("start_time"))) \
      .withColumn("day", day(col("start_time")))
 
-    # Write Gold to Delta with Vehicle Partitioning
+    # Delta Lake Small File Optimization:
+    # Use coarse date partitioning to eliminate the small file problem created by high-frequency microbatches
+    gold_partition_cols = ["date"]
+    try:
+        from deltalake import DeltaTable as PyDeltaTable
+        if os.path.exists(GOLD_DIR):
+            existing_parts = PyDeltaTable(GOLD_DIR).metadata().partition_columns
+            if existing_parts:
+                gold_partition_cols = existing_parts
+    except Exception:
+        pass
+
+    # Write Gold to Delta with Coarse Partitioning & Compaction Flags
     gold_query = gold_final.writeStream \
         .format("delta") \
-        .partitionBy("year", "month", "day", "vehicle_id") \
+        .partitionBy(*gold_partition_cols) \
         .option("checkpointLocation", os.path.join(CHECKPOINT_PATH, "gold_delta")) \
         .option("mergeSchema", "true") \
-        .option("overwriteSchema", "true") \
+        .option("delta.autoOptimize.optimizeWrite", "true") \
+        .option("delta.autoOptimize.autoCompact", "true") \
         .outputMode("append") \
         .trigger(processingTime="5 seconds") \
         .start(GOLD_DIR)

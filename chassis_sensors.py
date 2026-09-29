@@ -19,20 +19,53 @@ MAX_PITCH = 8.0    # deg
 MIN_ROLL = -6.0    # deg
 MAX_ROLL = 6.0     # deg
 
-# Scenarios with physical road profile parameters (ISO 8608 roughness and transient obstacle dynamics)
-SCENARIOS = {
-    "Run_Smooth_Highway": {
+# --- ISO 8608 ROAD ROUGHNESS CLASSIFICATION ---
+# Power Spectral Density (PSD): Gd(n) = Gd(n0) * (n / n0)^(-w)
+# Reference spatial frequency n0 = 0.1 cycles/m (0.1 m^-1), waviness w = 2
+# Values correspond to ISO 8608 geometric mean displacement PSD Gd(n0) in m^3
+ISO_8608_CLASSES = {
+    "A": {
+        "class": "A",
+        "name": "Class A (Very Good / Motorway)",
+        "Gd_n0": 2e-6,
         "target_speed_min": 90.0, "target_speed_max": 130.0,
-        "roughness_g0": 4e-6, "bump_prob": 0.002, "bump_height": 0.008
+        "bump_prob": 0.001, "bump_height": 0.006,  # Tiny expansion seams
     },
-    "Run_Urban_Road": {
+    "B": {
+        "class": "B",
+        "name": "Class B (Good / Smooth Pavement)",
+        "Gd_n0": 8e-6,
+        "target_speed_min": 65.0, "target_speed_max": 105.0,
+        "bump_prob": 0.008, "bump_height": 0.015,
+    },
+    "C": {
+        "class": "C",
+        "name": "Class C (Average / Urban & Secondary Road)",
+        "Gd_n0": 32e-6,
         "target_speed_min": 35.0, "target_speed_max": 65.0,
-        "roughness_g0": 32e-6, "bump_prob": 0.03, "bump_height": 0.030
+        "bump_prob": 0.030, "bump_height": 0.030,  # Speed bumps / manholes
     },
-    "Run_Pothole_Alley": {
+    "D": {
+        "class": "D",
+        "name": "Class D (Poor / Cobblestone & Pothole Alley)",
+        "Gd_n0": 128e-6,
         "target_speed_min": 20.0, "target_speed_max": 45.0,
-        "roughness_g0": 128e-6, "bump_prob": 0.12, "bump_height": -0.050
+        "bump_prob": 0.100, "bump_height": -0.050, # Severe potholes
     },
+    "E": {
+        "class": "E",
+        "name": "Class E (Very Poor / Extreme Deformation)",
+        "Gd_n0": 512e-6,
+        "target_speed_min": 15.0, "target_speed_max": 30.0,
+        "bump_prob": 0.180, "bump_height": -0.070, # Broken road craters
+    },
+}
+
+# Standard test scenarios mapped directly to ISO 8608 road roughness classes
+SCENARIOS = {
+    "Run_Smooth_Highway": ISO_8608_CLASSES["A"],
+    "Run_Urban_Road":     ISO_8608_CLASSES["C"],
+    "Run_Pothole_Alley":  ISO_8608_CLASSES["D"],
 }
 
 # Avro Schema for real-time streaming
@@ -69,15 +102,21 @@ class VehiclePhysics:
       - F_tire: Tire vertical stiffness + contact damping
       - Natural frequencies: Body bounce ~ 1.4 Hz, Wheel hop ~ 11.4 Hz
     """
-    def __init__(self, vehicle_id, scenario_name=None):
+    def __init__(self, vehicle_id, scenario_name=None, road_class=None):
         self.vehicle_id = vehicle_id
-        if scenario_name and scenario_name in SCENARIOS:
+        if road_class and road_class.upper() in ISO_8608_CLASSES:
+            rc = road_class.upper()
+            self.scenario_name = f"ISO_Class_{rc}"
+            self.params = ISO_8608_CLASSES[rc]
+        elif scenario_name and scenario_name in SCENARIOS:
             self.scenario_name = scenario_name
+            self.params = SCENARIOS[scenario_name]
         else:
             self.scenario_name = random.choice(list(SCENARIOS.keys()))
+            self.params = SCENARIOS[self.scenario_name]
         
-        self.test_id = f"{self.scenario_name}_{datetime.now().strftime('%H%M%S')}"
-        self.params = SCENARIOS[self.scenario_name]
+        iso_tag = self.params.get("class", "C")
+        self.test_id = f"{self.scenario_name}_ISO-{iso_tag}_{datetime.now().strftime('%H%M%S')}"
         
         # Quarter-Car 2-DOF Physical Parameters
         self.m_s = 320.0       # Sprung mass (kg)
@@ -124,6 +163,9 @@ class VehiclePhysics:
         if scenario_name in SCENARIOS:
             self.scenario_name = scenario_name
             self.params = SCENARIOS[scenario_name]
+        elif scenario_name in ISO_8608_CLASSES:
+            self.scenario_name = f"ISO_Class_{scenario_name}"
+            self.params = ISO_8608_CLASSES[scenario_name]
 
     def update(self, dt):
         """Advances vehicle dynamics using high-frequency numerical sub-stepping."""
@@ -155,15 +197,20 @@ class VehiclePhysics:
         sub_steps = 20
         h_step = dt / sub_steps
         
+        # ISO 8608 Filter Parameters: n0 = 0.1 cycles/m, f0 = 0.05 Hz cutoff
+        n0 = 0.1
+        f0 = 0.05
+        gd_n0 = self.params["Gd_n0"]
+        
         for _ in range(sub_steps):
             dx = v_ms * h_step
             self.road_profile_x += dx
             
-            # Base ISO 8608 Roughness (1st order filtered spatial white noise)
-            g0 = self.params["roughness_g0"]
-            noise_std = math.sqrt(2 * math.pi * g0 * max(1.0, v_ms) / h_step)
-            road_white_noise = random.gauss(0, 1.0) * noise_std * 0.015
-            self.z_r += -2 * math.pi * 0.1 * self.z_r * h_step + road_white_noise * h_step
+            # Exact ISO 8608 1st-order temporal shaping filter:
+            # dz_r/dt = -2*pi*f0 * z_r + 2*pi*n0 * sqrt(Gd(n0) * v) * w(t)
+            white_noise = random.gauss(0.0, 1.0)
+            dz_noise = 2.0 * math.pi * n0 * math.sqrt(gd_n0 * max(1.0, v_ms)) * math.sqrt(h_step) * white_noise
+            self.z_r = self.z_r * (1.0 - 2.0 * math.pi * f0 * h_step) + dz_noise
             
             # Add active obstacle profile (Half-sine wave)
             obstacle_z = 0.0
@@ -260,9 +307,11 @@ def run_simulation(args):
             sys.exit(1)
 
     # Initialize vehicles with different behaviors
-    vehicles = [VehiclePhysics(f"Vehicle_{i+1:02d}", args.scenario) for i in range(args.vehicle_count)]
+    vehicles = [VehiclePhysics(f"Vehicle_{i+1:02d}", scenario_name=args.scenario, road_class=args.road_class) for i in range(args.vehicle_count)]
     
     print(f"🚀 Launching simulation: {args.vehicle_count} vehicles at {args.frequency}Hz")
+    if args.road_class:
+        print(f"🛣️  Enforcing ISO 8608 Road Class: {args.road_class} ({ISO_8608_CLASSES[args.road_class]['name']})")
     print("💡 Dynamic bumps are enabled for visual verification on the dashboard.")
     
     period = 1.0 / args.frequency
@@ -298,7 +347,7 @@ def run_simulation(args):
             producer.flush()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Vehicle Telemetry Simulator (2-DOF Quarter-Car + ISO 8608)")
     parser.add_argument("--mode", choices=["console", "kafka"], default="kafka")
     parser.add_argument("--frequency", type=int, default=20)
     parser.add_argument("--vehicle_count", type=int, default=3)
@@ -306,6 +355,7 @@ if __name__ == "__main__":
     parser.add_argument("--bootstrap_servers", default="localhost:9092")
     parser.add_argument("--schema_registry", default="http://127.0.0.1:8081")
     parser.add_argument("--scenario", choices=list(SCENARIOS.keys()), help="Force a specific road scenario")
+    parser.add_argument("--road_class", choices=["A", "B", "C", "D", "E"], help="Force a specific ISO 8608 road roughness class (A=Very Good to E=Very Poor)")
     
     args = parser.parse_args()
     run_simulation(args)
