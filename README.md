@@ -17,11 +17,12 @@ In vehicle validation, individual driver preferences lead to inconsistent comfor
   * **Bronze:** Raw streaming Kafka records stored with ingestion timestamps.
   * **Silver:** Parsed, schema-validated records with dynamic filter $[-15, 15]\text{ m/s}^2$ capturing pothole impacts.
   * **Gold:** Windowed aggregations calculating statistical metrics, dominant frequencies, ISO 2631-1 weighted acceleration ($a_w$), and Vibration Dose Values (VDV). Optimized with coarse date partitioning and auto-compaction to eliminate the Delta Lake Small File Problem.
-* **Signal Processing (ISO 2631-1 Standards):** 
+* **Signal Processing (ISO 2631-1 Standards & Road Holding Safety):** 
   * **Continuous Vibration (FFT $W_k$ Filter):** Decomposes vertical acceleration into the frequency domain, applying the $W_k$ sensitivity curve centered on the $4–8\text{ Hz}$ spinal resonance band.
   * **Transient Shock (Vibration Dose Value - VDV):** Reconstructs the weighted time history $a_w(t)$ via inverse FFT and calculates 4th-power accumulated shock dosage: $\text{VDV} = (\Delta t \sum a_w^4)^{1/4}$.
   * **Crest Factor ($\text{Peak}/\text{RMS}$):** Automatically flags when Crest Factor $> 9.0$, where standard RMS fails and VDV governs.
   * **Qualitative Scales:** Classifies comfort into official ISO 2631-1 tiers (*Comfortable*, *A little uncomfortable*, *Fairly uncomfortable*, *Uncomfortable*, *Very uncomfortable*, *Extremely uncomfortable*).
+  * **Road-Holding & Safety Metric (Dynamic Tire Load Ratio):** Computes normalized tire normal force $\eta = F_z / F_{z,\text{static}}$. Flags wheel lift-off hazards when $\eta_{\min} < 0.15$, capturing the authentic automotive trade-off between soft ride comfort and tire pavement grip.
 
 ---
 

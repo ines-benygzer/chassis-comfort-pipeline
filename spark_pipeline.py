@@ -165,7 +165,8 @@ def main():
         {"name": "acc_z", "type": "double"},
         {"name": "suspension_mm", "type": "double"},
         {"name": "pitch_deg", "type": "double"},
-        {"name": "roll_deg", "type": "double"}
+        {"name": "roll_deg", "type": "double"},
+        {"name": "tire_load_ratio", "type": "double"}
       ]
     }
     """
@@ -233,6 +234,8 @@ def main():
             sqrt(avg(col("acc_z")**2)).alias("rms_acc_z"),
             spark_max(spark_abs(col("acc_z"))).alias("peak_acc_z"),
             avg("speed_kmh").alias("avg_speed"),
+            spark_min(expr("COALESCE(tire_load_ratio, 1.0)")).alias("min_tire_load"),
+            avg(expr("COALESCE(tire_load_ratio, 1.0)")).alias("avg_tire_load"),
             collect_list("acc_z").alias("acc_z_series")
         )
 
@@ -247,14 +250,19 @@ def main():
     # Severe pothole shocks penalize comfort through VDV even if baseline RMS is low
     gold_metrics = gold_with_iso \
         .withColumn("comfort_score", 
-            expr("GREATEST(0.0, LEAST(100.0, 100.0 - (weighted_acc_z * 40.0 + vdv_acc_z * 12.0)))"))
+            expr("GREATEST(0.0, LEAST(100.0, 100.0 - (weighted_acc_z * 40.0 + vdv_acc_z * 12.0)))")) \
+        .withColumn("road_holding_tier",
+            expr("CASE WHEN min_tire_load < 0.15 THEN 'CRITICAL (Wheel Lift Hazard)' " +
+                 "WHEN min_tire_load < 0.40 THEN 'MARGINAL (Tire Unloading)' " +
+                 "ELSE 'OPTIMAL (Full Grip)' END"))
 
     gold_final = gold_metrics.select(
         col("window.start").alias("start_time"),
         col("window.end").alias("end_time"),
         "vehicle_id", "test_id", "rms_acc_z", "peak_acc_z", 
         "avg_speed", "weighted_acc_z", "vdv_acc_z", "crest_factor",
-        "dominant_freq", "shock_event", "iso_comfort_tier", "comfort_score"
+        "dominant_freq", "shock_event", "iso_comfort_tier", "comfort_score",
+        "min_tire_load", "avg_tire_load", "road_holding_tier"
     ).withColumn("date", to_date(col("start_time"))) \
      .withColumn("year", year(col("start_time"))) \
      .withColumn("month", month(col("start_time"))) \

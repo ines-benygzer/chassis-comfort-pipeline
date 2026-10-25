@@ -50,6 +50,9 @@ def load_comprehensive_data(path):
             ('dominant_freq', 0.0),
             ('shock_event', 'NOMINAL'),
             ('iso_comfort_tier', 'Comfortable'),
+            ('min_tire_load', 1.0),
+            ('avg_tire_load', 1.0),
+            ('road_holding_tier', 'OPTIMAL (Full Grip)'),
         ]:
             if col_name not in df.columns:
                 df[col_name] = default_val
@@ -58,7 +61,7 @@ def load_comprehensive_data(path):
         df['start_time'] = pd.to_datetime(df['start_time'])
         
         # Numeric cleanup for NaN/Inf
-        for num_col in ['weighted_acc_z', 'vdv_acc_z', 'crest_factor', 'comfort_score', 'rms_acc_z', 'dominant_freq']:
+        for num_col in ['weighted_acc_z', 'vdv_acc_z', 'crest_factor', 'comfort_score', 'rms_acc_z', 'dominant_freq', 'min_tire_load', 'avg_tire_load']:
             if num_col in df.columns:
                 df[num_col] = pd.to_numeric(df[num_col], errors='coerce').fillna(0.0)
         
@@ -100,7 +103,7 @@ if not df_viz.empty:
     latest = df_viz.iloc[-1]
     prev = df_viz.iloc[-2] if len(df_viz) > 1 else latest
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     
     # ISO 2631-1 Thresholds & Color Coding
     w_acc = latest['weighted_acc_z']
@@ -109,6 +112,8 @@ if not df_viz.empty:
     shock_flag = latest.get('shock_event', 'NOMINAL')
     tier_label = latest.get('iso_comfort_tier', 'Comfortable')
     dom_freq = latest.get('dominant_freq', 0.0)
+    tire_load = latest.get('min_tire_load', 1.0)
+    holding_tier = latest.get('road_holding_tier', 'OPTIMAL (Full Grip)')
 
     if pd.isna(w_acc) or not np.isfinite(w_acc):
         status, color, emoji = "Initializing...", "#888888", "⚪"
@@ -140,6 +145,10 @@ if not df_viz.empty:
         st.metric("Crest Factor (Peak/RMS)", f"{cf_val:.2f}")
         st.markdown(f"<p style='color:{cf_color}; font-weight:bold; font-size:12px;'>{'⚠️ ' + shock_flag if cf_val > 9.0 else '✅ ' + shock_flag}</p>", unsafe_allow_html=True)
     with c5:
+        grip_color = "#00CC66" if tire_load >= 0.40 else ("#FFA500" if tire_load >= 0.15 else "#FF3300")
+        st.metric("Tire Load Ratio (η_min)", f"{tire_load:.2f}")
+        st.markdown(f"<p style='color:{grip_color}; font-weight:bold; font-size:12px;'>{holding_tier}</p>", unsafe_allow_html=True)
+    with c6:
         st.metric("Speed / Dominant Freq", f"{latest['avg_speed']:.1f} km/h")
         st.caption(f"Peak Frequency: **{dom_freq:.1f} Hz**")
 
@@ -185,21 +194,24 @@ if not df_viz.empty:
         st.plotly_chart(fig_vib, use_container_width=True)
 
     with row2_right:
-        st.subheader("🎯 Crest Factor vs Speed (Shock Profiling)")
-        # Scatter for Crest Factor vs Speed
-        y_scatter = "crest_factor" if "crest_factor" in df_viz.columns else "weighted_acc_z"
-        fig_corr = px.scatter(df_viz, x="avg_speed", y=y_scatter, 
-                              size="rms_acc_z", color="comfort_score", 
-                              hover_data=["test_id", "shock_event"] if "shock_event" in df_viz.columns else ["test_id"],
-                              template="plotly_dark", color_continuous_scale="Viridis")
-        fig_corr.add_hline(y=9.0, line_dash="dash", line_color="red", annotation_text="ISO Shock Threshold (CF > 9)")
-        fig_corr.update_layout(margin=dict(l=0, r=0, t=20, b=0))
-        st.plotly_chart(fig_corr, use_container_width=True)
+        st.subheader("🛡️ Road-Holding Safety: Dynamic Tire Load (η)")
+        fig_tire = go.Figure()
+        if 'min_tire_load' in df_viz.columns:
+            fig_tire.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["min_tire_load"], name="Min Tire Load Ratio (η_min)", line=dict(color="#00D4FF", width=2.5)))
+        if 'avg_tire_load' in df_viz.columns:
+            fig_tire.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["avg_tire_load"], name="Avg Tire Load (η_avg)", line=dict(color="#AAAAAA", width=1.5, dash="dot")))
+            
+        # Add Safety Threshold Lines
+        fig_tire.add_hline(y=1.0, line_dash="solid", line_color="#555555", annotation_text="Nominal Equilibrium (η = 1.0)")
+        fig_tire.add_hline(y=0.40, line_dash="dash", line_color="yellow", annotation_text="Marginal Grip (η = 0.40)")
+        fig_tire.add_hline(y=0.15, line_dash="dash", line_color="red", annotation_text="CRITICAL: Wheel Lift Hazard (η = 0.15)")
+        fig_tire.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=20, b=0), yaxis_range=[0.0, max(2.5, df_viz['min_tire_load'].max() + 0.5) if 'min_tire_load' in df_viz.columns else 2.5], legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(fig_tire, use_container_width=True)
 
     # Historical Data Table
     with st.expander("Extended History Data (View All Samples)"):
         st.write(f"Displaying all {len(df_viz)} processed windows for **{selected_vehicle}** - Test: **{selected_test}**")
-        cols_to_show = [c for c in ['start_time', 'vehicle_id', 'comfort_score', 'iso_comfort_tier', 'weighted_acc_z', 'vdv_acc_z', 'crest_factor', 'shock_event', 'dominant_freq', 'avg_speed', 'rms_acc_z', 'peak_acc_z'] if c in df_viz.columns]
+        cols_to_show = [c for c in ['start_time', 'vehicle_id', 'comfort_score', 'iso_comfort_tier', 'min_tire_load', 'road_holding_tier', 'weighted_acc_z', 'vdv_acc_z', 'crest_factor', 'shock_event', 'dominant_freq', 'avg_speed', 'rms_acc_z', 'peak_acc_z'] if c in df_viz.columns]
         st.dataframe(df_viz[cols_to_show].sort_values("start_time", ascending=False), use_container_width=True)
 
 else:
