@@ -17,11 +17,16 @@ In vehicle validation, individual driver preferences lead to inconsistent comfor
   * **Bronze:** Raw streaming Kafka records stored with ingestion timestamps.
   * **Silver:** Parsed, schema-validated records with dynamic filter $[-15, 15]\text{ m/s}^2$ capturing pothole impacts.
   * **Gold:** Windowed aggregations calculating statistical metrics, dominant frequencies, ISO 2631-1 weighted acceleration ($a_w$), and Vibration Dose Values (VDV). Optimized with coarse date partitioning and auto-compaction to eliminate the Delta Lake Small File Problem.
-* **Signal Processing (ISO 2631-1 Standards & Road Holding Safety):** 
-  * **Continuous Vibration (FFT $W_k$ Filter):** Decomposes vertical acceleration into the frequency domain, applying the $W_k$ sensitivity curve centered on the $4–8\text{ Hz}$ spinal resonance band.
-  * **Transient Shock (Vibration Dose Value - VDV):** Reconstructs the weighted time history $a_w(t)$ via inverse FFT and calculates 4th-power accumulated shock dosage: $\text{VDV} = (\Delta t \sum a_w^4)^{1/4}$.
-  * **Crest Factor ($\text{Peak}/\text{RMS}$):** Automatically flags when Crest Factor $> 9.0$, where standard RMS fails and VDV governs.
-  * **Qualitative Scales:** Classifies comfort into official ISO 2631-1 tiers (*Comfortable*, *A little uncomfortable*, *Fairly uncomfortable*, *Uncomfortable*, *Very uncomfortable*, *Extremely uncomfortable*).
+* **Signal Processing (Full Multi-Axial ISO 2631-1 & Road-Holding Safety):** 
+  * **Tri-Axial Frequency Weighting ($W_k$ & $W_d$):**
+    * **Vertical ($z$-axis, $W_k$ filter):** Targets human spinal resonance in the **$4–8\text{ Hz}$** band ($k_z = 1.0$).
+    * **Longitudinal ($x$-axis, $W_d$ filter):** Targets fore-and-aft pitch jerk and braking in the **$0.5–2\text{ Hz}$** vestibular band ($k_x = 1.0$).
+    * **Lateral ($y$-axis, $W_d$ filter):** Targets cornering roll and side-to-side sway in the **$0.5–2\text{ Hz}$** band ($k_y = 1.0$).
+  * **Point Vibration Total Value ($a_v$):** Implements ISO 2631-1 Section 6.5 vector summation:
+    $$a_v = \sqrt{k_x^2 a_{wx}^2 + k_y^2 a_{wy}^2 + k_z^2 a_{wz}^2}$$
+  * **Tri-Axial Vibration Dose Value ($\text{VDV}_{\text{total}}$):** Combines 4th-power transient shock dosage across all axes: $\text{VDV}_{\text{total}} = (\text{VDV}_x^4 + \text{VDV}_y^4 + \text{VDV}_z^4)^{1/4}$.
+  * **Crest Factor ($\text{Peak}/\text{RMS}$):** Automatically flags when vertical Crest Factor $> 9.0$, where standard RMS fails and VDV governs.
+  * **Qualitative Scales:** Classifies comfort into official ISO 2631-1 tiers (*Comfortable*, *A little uncomfortable*, *Fairly uncomfortable*, *Uncomfortable*, *Very uncomfortable*, *Extremely uncomfortable*) mapped directly to $a_v$.
   * **Road-Holding & Safety Metric (Dynamic Tire Load Ratio):** Computes normalized tire normal force $\eta = F_z / F_{z,\text{static}}$. Flags wheel lift-off hazards when $\eta_{\min} < 0.15$, capturing the authentic automotive trade-off between soft ride comfort and tire pavement grip.
 
 ---

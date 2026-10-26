@@ -45,9 +45,15 @@ def load_comprehensive_data(path):
         # Ensure columns exist for backward compatibility across schema evolutions
         for col_name, default_val in [
             ('weighted_acc_z', 0.0),
+            ('weighted_acc_x', 0.0),
+            ('weighted_acc_y', 0.0),
+            ('total_acc_v', 0.0),
             ('vdv_acc_z', 0.0),
+            ('vdv_total', 0.0),
             ('crest_factor', 1.0),
+            ('crest_factor_z', 1.0),
             ('dominant_freq', 0.0),
+            ('dominant_freq_z', 0.0),
             ('shock_event', 'NOMINAL'),
             ('iso_comfort_tier', 'Comfortable'),
             ('min_tire_load', 1.0),
@@ -61,7 +67,7 @@ def load_comprehensive_data(path):
         df['start_time'] = pd.to_datetime(df['start_time'])
         
         # Numeric cleanup for NaN/Inf
-        for num_col in ['weighted_acc_z', 'vdv_acc_z', 'crest_factor', 'comfort_score', 'rms_acc_z', 'dominant_freq', 'min_tire_load', 'avg_tire_load']:
+        for num_col in ['weighted_acc_z', 'weighted_acc_x', 'weighted_acc_y', 'total_acc_v', 'vdv_acc_z', 'vdv_total', 'crest_factor', 'crest_factor_z', 'comfort_score', 'rms_acc_z', 'dominant_freq', 'dominant_freq_z', 'min_tire_load', 'avg_tire_load']:
             if num_col in df.columns:
                 df[num_col] = pd.to_numeric(df[num_col], errors='coerce').fillna(0.0)
         
@@ -105,27 +111,33 @@ if not df_viz.empty:
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     
-    # ISO 2631-1 Thresholds & Color Coding
-    w_acc = latest['weighted_acc_z']
-    vdv_val = latest.get('vdv_acc_z', 0.0)
-    cf_val = latest.get('crest_factor', 1.0)
+    # ISO 2631-1 Multi-Axial Thresholds & Color Coding
+    total_av = latest.get('total_acc_v', latest.get('weighted_acc_z', 0.0))
+    prev_av = prev.get('total_acc_v', prev.get('weighted_acc_z', total_av))
+    w_acc_z = latest.get('weighted_acc_z', 0.0)
+    w_acc_x = latest.get('weighted_acc_x', 0.0)
+    w_acc_y = latest.get('weighted_acc_y', 0.0)
+    vdv_total = latest.get('vdv_total', latest.get('vdv_acc_z', 0.0))
+    prev_vdv = prev.get('vdv_total', prev.get('vdv_acc_z', vdv_total))
+    cf_val = latest.get('crest_factor_z', latest.get('crest_factor', 1.0))
     shock_flag = latest.get('shock_event', 'NOMINAL')
     tier_label = latest.get('iso_comfort_tier', 'Comfortable')
-    dom_freq = latest.get('dominant_freq', 0.0)
+    dom_freq = latest.get('dominant_freq_z', latest.get('dominant_freq', 0.0))
     tire_load = latest.get('min_tire_load', 1.0)
     holding_tier = latest.get('road_holding_tier', 'OPTIMAL (Full Grip)')
 
-    if pd.isna(w_acc) or not np.isfinite(w_acc):
+    # Overall Comfort Evaluation based on Point Vibration Total Value (a_v)
+    if pd.isna(total_av) or not np.isfinite(total_av):
         status, color, emoji = "Initializing...", "#888888", "⚪"
-    elif w_acc < 0.315:
+    elif total_av < 0.315:
         status, color, emoji = "Comfortable", "#00FF00", "🟢"
-    elif w_acc < 0.63:
+    elif total_av < 0.63:
         status, color, emoji = "A little uncomfortable", "#FFFF00", "🟡"
-    elif w_acc < 1.0:
+    elif total_av < 1.0:
         status, color, emoji = "Fairly uncomfortable", "#FF9900", "🟠"
-    elif w_acc < 1.6:
+    elif total_av < 1.6:
         status, color, emoji = "Uncomfortable", "#FF6600", "🟠"
-    elif w_acc < 2.5:
+    elif total_av < 2.5:
         status, color, emoji = "Very Uncomfortable", "#FF3300", "🔴"
     else:
         status, color, emoji = "Extremely Uncomfortable", "#CC0000", "🛑"
@@ -134,12 +146,11 @@ if not df_viz.empty:
         st.metric("Comfort Score", f"{latest['comfort_score']:.1f}%", f"{latest['comfort_score'] - prev['comfort_score']:.1f}%")
         st.markdown(f"<p style='color:{color}; font-weight:bold;'>{emoji} {status}</p>", unsafe_allow_html=True)
     with c2:
-        st.metric("ISO 2631 Weighted (a_w)", f"{w_acc:.3f} m/s²", f"{w_acc - prev['weighted_acc_z']:.4f}", delta_color="inverse")
-        st.caption(f"Tier: **{tier_label}**")
+        st.metric("Total Vibration (a_v)", f"{total_av:.3f} m/s²", f"{total_av - prev_av:.4f}", delta_color="inverse")
+        st.caption(f"Z: {w_acc_z:.2f} | X: {w_acc_x:.2f} | Y: {w_acc_y:.2f}")
     with c3:
-        prev_vdv = prev.get('vdv_acc_z', vdv_val)
-        st.metric("Vibration Dose Value (VDV)", f"{vdv_val:.3f} m/s¹·⁷⁵", f"{vdv_val - prev_vdv:.4f}", delta_color="inverse")
-        st.caption("Transient shock dose (4th power)")
+        st.metric("Tri-Axial VDV Total", f"{vdv_total:.3f} m/s¹·⁷⁵", f"{vdv_total - prev_vdv:.4f}", delta_color="inverse")
+        st.caption("Combined 4th-power shock dose")
     with c4:
         cf_color = "#FF4444" if cf_val > 9.0 else "#00CC66"
         st.metric("Crest Factor (Peak/RMS)", f"{cf_val:.2f}")
@@ -150,7 +161,7 @@ if not df_viz.empty:
         st.markdown(f"<p style='color:{grip_color}; font-weight:bold; font-size:12px;'>{holding_tier}</p>", unsafe_allow_html=True)
     with c6:
         st.metric("Speed / Dominant Freq", f"{latest['avg_speed']:.1f} km/h")
-        st.caption(f"Peak Frequency: **{dom_freq:.1f} Hz**")
+        st.caption(f"Vertical Peak: **{dom_freq:.1f} Hz**")
 
     st.divider()
 
@@ -166,13 +177,16 @@ if not df_viz.empty:
         st.plotly_chart(fig_score, use_container_width=True)
 
     with row1_right:
-        st.subheader("⚡ Continuous Vibration (a_w) vs. Shock Metric (VDV)")
-        # Multi-trace chart for Weighted vs VDV vs RMS
+        st.subheader("🌐 Tri-Axial ISO 2631-1 Vibration Breakdown")
+        # Multi-trace chart for Tri-axial vibration
         fig_acc = go.Figure()
-        fig_acc.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["rms_acc_z"], name="Raw RMS", fill='tozeroy', line=dict(color="#636EFA", width=1.5)))
-        fig_acc.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["weighted_acc_z"], name="ISO Weighted (a_w)", line=dict(color="#FF7F0E", width=2.5)))
-        if 'vdv_acc_z' in df_viz.columns:
-            fig_acc.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["vdv_acc_z"], name="VDV Shock (m/s^1.75)", line=dict(color="#00FFAA", width=2, dash="dot")))
+        if 'total_acc_v' in df_viz.columns:
+            fig_acc.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["total_acc_v"], name="Total Vibration (a_v)", line=dict(color="#FFFFFF", width=3)))
+        fig_acc.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["weighted_acc_z"], name="Vertical (a_wz, Wk)", line=dict(color="#FF7F0E", width=2)))
+        if 'weighted_acc_x' in df_viz.columns:
+            fig_acc.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["weighted_acc_x"], name="Longitudinal (a_wx, Wd)", line=dict(color="#00D4FF", width=1.5, dash="dot")))
+        if 'weighted_acc_y' in df_viz.columns:
+            fig_acc.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["weighted_acc_y"], name="Lateral (a_wy, Wd)", line=dict(color="#FF00AA", width=1.5, dash="dot")))
         
         # Add ISO Threshold Lines
         fig_acc.add_hline(y=0.315, line_dash="dash", line_color="green", annotation_text="Comfortable (<0.315)")
@@ -185,8 +199,13 @@ if not df_viz.empty:
     row2_left, row2_right = st.columns(2)
 
     with row2_left:
-        st.subheader("📈 ISO 2631 Weighted Acc. & VDV Trends")
+        st.subheader("📈 Tri-Axial Shock Dose (VDV) Trends")
         fig_vib = go.Figure()
+        if 'vdv_total' in df_viz.columns:
+            fig_vib.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["vdv_total"], name="Total VDV (m/s^1.75)", fill='tozeroy', line=dict(color="#00FFAA", width=2.5)))
+        fig_vib.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["weighted_acc_z"], name="Vertical a_wz", line=dict(color="#FF7F0E", width=2)))
+        fig_vib.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=20, b=0), legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(fig_vib, use_container_width=True)
         fig_vib.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["weighted_acc_z"], name="Weighted Acc (a_w)", fill='tozeroy', line=dict(color="#FF7F0E")))
         if 'vdv_acc_z' in df_viz.columns:
             fig_vib.add_trace(go.Scatter(x=df_viz["start_time"], y=df_viz["vdv_acc_z"], name="VDV", line=dict(color="#00FFAA", width=2)))
@@ -211,7 +230,7 @@ if not df_viz.empty:
     # Historical Data Table
     with st.expander("Extended History Data (View All Samples)"):
         st.write(f"Displaying all {len(df_viz)} processed windows for **{selected_vehicle}** - Test: **{selected_test}**")
-        cols_to_show = [c for c in ['start_time', 'vehicle_id', 'comfort_score', 'iso_comfort_tier', 'min_tire_load', 'road_holding_tier', 'weighted_acc_z', 'vdv_acc_z', 'crest_factor', 'shock_event', 'dominant_freq', 'avg_speed', 'rms_acc_z', 'peak_acc_z'] if c in df_viz.columns]
+        cols_to_show = [c for c in ['start_time', 'vehicle_id', 'comfort_score', 'iso_comfort_tier', 'total_acc_v', 'weighted_acc_z', 'weighted_acc_x', 'weighted_acc_y', 'vdv_total', 'min_tire_load', 'road_holding_tier', 'crest_factor_z', 'shock_event', 'dominant_freq_z', 'avg_speed', 'rms_acc_z', 'peak_acc_z'] if c in df_viz.columns]
         st.dataframe(df_viz[cols_to_show].sort_values("start_time", ascending=False), use_container_width=True)
 
 else:

@@ -71,82 +71,101 @@ def main():
         .config("spark.sql.shuffle.partitions", "2") \
         .getOrCreate()
 
-    # --- ISO 2631-1 MULTI-METRIC COMFORT & SHOCK EVALUATION (UDF) ---
-    iso_metrics_schema = StructType([
-        StructField("weighted_acc_z", DoubleType(), False),
-        StructField("vdv_acc_z", DoubleType(), False),
-        StructField("crest_factor", DoubleType(), False),
-        StructField("dominant_freq", DoubleType(), False),
-        StructField("shock_event", StringType(), False),
-        StructField("iso_comfort_tier", StringType(), False),
+    # --- FULL MULTI-AXIAL ISO 2631-1:1997 COMFORT & SHOCK EVALUATION (UDF) ---
+    iso_multi_axial_schema = StructType([
+        StructField("weighted_acc_z", DoubleType(), False),  # a_wz (vertical, Wk filter, m/s^2)
+        StructField("weighted_acc_x", DoubleType(), False),  # a_wx (longitudinal, Wd filter, m/s^2)
+        StructField("weighted_acc_y", DoubleType(), False),  # a_wy (lateral, Wd filter, m/s^2)
+        StructField("total_acc_v", DoubleType(), False),     # a_v = sqrt(kx^2*awx^2 + ky^2*awy^2 + kz^2*awz^2)
+        StructField("vdv_total", DoubleType(), False),       # Multi-axial VDV = (VDVx^4 + VDVy^4 + VDVz^4)^0.25 (m/s^1.75)
+        StructField("vdv_acc_z", DoubleType(), False),       # Vertical shock dosage VDV_z
+        StructField("crest_factor_z", DoubleType(), False),  # Crest Factor on vertical
+        StructField("dominant_freq_z", DoubleType(), False), # Dominant frequency on vertical (Hz)
+        StructField("shock_event", StringType(), False),     # Shock alert flag
+        StructField("iso_comfort_tier", StringType(), False),# ISO 2631-1 comfort classification from a_v
     ])
 
-    @udf(iso_metrics_schema)
-    def calculate_iso_comfort_metrics(acc_z_list):
+    @udf(iso_multi_axial_schema)
+    def calculate_triaxial_iso_metrics(acc_x_list, acc_y_list, acc_z_list):
         """
-        Computes ISO 2631-1 multi-dimensional vibration and shock comfort metrics:
-          1. Continuous Vibration: Wk frequency-weighted RMS acceleration (aw) via FFT.
-          2. Transient Shock: Vibration Dose Value (VDV) using 4th-power time integration.
-          3. Crest Factor: Peak / RMS ratio (when CF > 9, standard RMS is invalid and VDV governs).
-          4. Dominant Frequency: Frequency of maximum spectral energy.
-          5. Qualitative Comfort Scale: Official ISO 2631-1:1997 Annex C rating.
+        Full Multi-Axial ISO 2631-1:1997 human vibration comfort evaluation:
+          1. Vertical (z-axis): Wk filter (peak sensitivity at 4-8 Hz for spine compression).
+          2. Longitudinal (x-axis) & Lateral (y-axis): Wd filter (peak sensitivity at 0.5-2 Hz for vestibular/sway).
+          3. Point Vibration Total Value (a_v):
+             a_v = sqrt(kx^2 * a_wx^2 + ky^2 * a_wy^2 + kz^2 * a_wz^2), with kx=1.0, ky=1.0, kz=1.0 (seated).
+          4. Tri-Axial Vibration Dose Value (VDV_total):
+             VDV_total = (VDV_x^4 + VDV_y^4 + VDV_z^4)^(1/4)
+          5. Official ISO 2631-1 Annex C Scale mapped to total vibration a_v.
         """
-        default_res = (0.0, 0.0, 1.0, 0.0, "NOMINAL", "Comfortable")
+        default_res = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, "NOMINAL", "Comfortable")
         try:
             if acc_z_list is None or len(acc_z_list) < 4:
                 return default_res
             
-            y = np.nan_to_num(np.array(acc_z_list, dtype=float), nan=0.0)
-            n = len(y)
+            n = len(acc_z_list)
             dt = 1.0 / SAMPLING_RATE
             
-            # 1. Detrend signal (remove DC acceleration offset)
-            y_detrend = y - np.mean(y)
+            # Wk Weights (ISO 2631-1 Vertical, peak 4-8 Hz)
+            wk_freqs = np.array([0.5, 1.0, 2.0, 4.0, 5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0])
+            wk_gains = np.array([0.062, 0.176, 0.643, 0.967, 1.000, 0.977, 0.892, 0.776, 0.648, 0.512, 0.409, 0.330, 0.266, 0.215, 0.176, 0.145, 0.119])
             
-            # 2. Fourier Transform (rfft)
-            yf = np.fft.rfft(y_detrend)
-            xf = np.fft.rfftfreq(n, dt)
+            # Wd Weights (ISO 2631-1 Horizontal, peak 0.5-2 Hz)
+            wd_freqs = np.array([0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 3.15, 4.0, 5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0])
+            wd_gains = np.array([0.214, 0.316, 0.468, 0.638, 0.794, 0.912, 1.000, 0.912, 0.785, 0.631, 0.501, 0.398, 0.313, 0.248, 0.197, 0.155, 0.123, 0.098, 0.078, 0.062, 0.049, 0.039, 0.031])
+
+            def filter_axis(arr, freqs, gains):
+                y = np.nan_to_num(np.array(arr, dtype=float), nan=0.0)
+                y_detrend = y - np.mean(y)
+                yf = np.fft.rfft(y_detrend)
+                xf = np.fft.rfftfreq(len(y), dt)
+                w_interp = np.interp(xf, freqs, gains, left=0.0, right=0.0)
+                sig_w = np.fft.irfft(yf * w_interp, len(y))
+                rms = float(np.sqrt(np.mean(sig_w**2)))
+                vdv = float((dt * np.sum(sig_w**4))**0.25)
+                return sig_w, rms, vdv, yf, xf
+
+            # 1. Vertical Filtering (Wk)
+            sig_wz, a_wz, vdv_z, yf_z, xf_z = filter_axis(acc_z_list, wk_freqs, wk_gains)
             
-            # 3. ISO 2631-1 Wk Weighting Curve (Vertical vibration sensitivity, peak at 4-8 Hz)
-            freqs = np.array([0.5, 1.0, 2.0, 4.0, 5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0])
-            gains = np.array([0.062, 0.176, 0.643, 0.967, 1.000, 0.977, 0.892, 0.776, 0.648, 0.512, 0.409, 0.330, 0.266, 0.215, 0.176, 0.145, 0.119])
-            wk_gains = np.interp(xf, freqs, gains, left=0.0, right=0.0)
+            # 2. Longitudinal Filtering (Wd)
+            acc_x = acc_x_list if (acc_x_list and len(acc_x_list) == n) else [0.0]*n
+            _, a_wx, vdv_x, _, _ = filter_axis(acc_x, wd_freqs, wd_gains)
             
-            # 4. Filtered signal in frequency and time domain
-            yf_weighted = yf * wk_gains
-            # Inverse FFT to reconstruct exact weighted time history aw(t)
-            aw_t = np.fft.irfft(yf_weighted, n)
+            # 3. Lateral Filtering (Wd)
+            acc_y = acc_y_list if (acc_y_list and len(acc_y_list) == n) else [0.0]*n
+            _, a_wy, vdv_y, _, _ = filter_axis(acc_y, wd_freqs, wd_gains)
+
+            # 4. Point Vibration Total Value (a_v) - ISO 2631-1 Section 6.5:
+            # kx = 1.0, ky = 1.0, kz = 1.0 for seated passengers
+            a_v = float(np.sqrt(1.0 * (a_wx**2) + 1.0 * (a_wy**2) + 1.0 * (a_wz**2)))
             
-            # 5. Continuous Vibration: Weighted RMS aw (m/s^2)
-            weighted_rms = float(np.sqrt(np.mean(aw_t**2)))
+            # 5. Tri-Axial Vibration Dose Value (VDV_total)
+            vdv_total = float((vdv_x**4 + vdv_y**4 + vdv_z**4)**0.25)
             
-            # 6. Transient Shock: Vibration Dose Value (VDV in m/s^1.75) via 4th-power integral
-            vdv = float((dt * np.sum(aw_t**4))**0.25)
+            # 6. Crest Factor on Vertical (ISO 2631-1: CF > 9 requires VDV)
+            peak_wz = float(np.max(np.abs(sig_wz)))
+            crest_factor_z = float(peak_wz / max(0.001, a_wz))
+            shock_event = "SHOCK_DETECTED (CF>9)" if crest_factor_z > 9.0 else "NOMINAL"
             
-            # 7. Crest Factor: Peak / RMS ratio (ISO 2631-1 Section 6.3.3: CF > 9 requires VDV)
-            peak_aw = float(np.max(np.abs(aw_t)))
-            crest_factor = float(peak_aw / max(0.001, weighted_rms))
-            shock_event = "SHOCK_DETECTED (CF>9)" if crest_factor > 9.0 else "NOMINAL"
-            
-            # 8. Dominant Frequency (ignoring DC)
-            powers = np.abs(yf)**2
-            dominant_freq = float(xf[np.argmax(powers[1:]) + 1]) if len(powers) > 1 else 0.0
-            
-            # 9. Official ISO 2631-1:1997 Annex C Comfort Classification
-            if weighted_rms < 0.315:
+            # 7. Dominant Frequency on Vertical
+            powers_z = np.abs(yf_z)**2
+            dom_freq_z = float(xf_z[np.argmax(powers_z[1:]) + 1]) if len(powers_z) > 1 else 0.0
+
+            # 8. Official ISO 2631-1:1997 Annex C Comfort Classification (based on a_v)
+            if a_v < 0.315:
                 comfort_tier = "Comfortable"
-            elif weighted_rms < 0.63:
+            elif a_v < 0.63:
                 comfort_tier = "A little uncomfortable"
-            elif weighted_rms < 1.0:
+            elif a_v < 1.0:
                 comfort_tier = "Fairly uncomfortable"
-            elif weighted_rms < 1.6:
+            elif a_v < 1.6:
                 comfort_tier = "Uncomfortable"
-            elif weighted_rms < 2.5:
+            elif a_v < 2.5:
                 comfort_tier = "Very uncomfortable"
             else:
                 comfort_tier = "Extremely uncomfortable"
-                
-            return (weighted_rms, vdv, crest_factor, dominant_freq, shock_event, comfort_tier)
+
+            return (a_wz, a_wx, a_wy, a_v, vdv_total, vdv_z, crest_factor_z, dom_freq_z, shock_event, comfort_tier)
         except Exception:
             return default_res
 
@@ -162,6 +181,8 @@ def main():
         {"name": "test_id", "type": "string"},
         {"name": "timestamp", "type": "double"},
         {"name": "speed_kmh", "type": "double"},
+        {"name": "acc_x", "type": "double"},
+        {"name": "acc_y", "type": "double"},
         {"name": "acc_z", "type": "double"},
         {"name": "suspension_mm", "type": "double"},
         {"name": "pitch_deg", "type": "double"},
@@ -210,6 +231,8 @@ def main():
         .filter(col("acc_z").isNotNull()) \
         .filter(col("acc_z").between(-15.0, 15.0)) \
         .filter(col("speed_kmh") >= 0) \
+        .withColumn("acc_x", expr("COALESCE(acc_x, 0.0)")) \
+        .withColumn("acc_y", expr("COALESCE(acc_y, 0.0)")) \
         .withColumn("event_time", to_timestamp(col("timestamp"))) \
         .withColumn("year", year(col("event_time"))) \
         .withColumn("month", month(col("event_time"))) \
@@ -236,21 +259,22 @@ def main():
             avg("speed_kmh").alias("avg_speed"),
             spark_min(expr("COALESCE(tire_load_ratio, 1.0)")).alias("min_tire_load"),
             avg(expr("COALESCE(tire_load_ratio, 1.0)")).alias("avg_tire_load"),
+            collect_list("acc_x").alias("acc_x_series"),
+            collect_list("acc_y").alias("acc_y_series"),
             collect_list("acc_z").alias("acc_z_series")
         )
 
-    # Apply ISO 2631-1 Multi-Metric Comfort Evaluation (FFT + VDV + Crest Factor)
+    # Apply Full Multi-Axial ISO 2631-1:1997 Comfort Evaluation (Wk + Wd + Total Vibration av)
     gold_with_iso = gold_windowed \
-        .withColumn("iso_metrics", calculate_iso_comfort_metrics(col("acc_z_series"))) \
+        .withColumn("iso_metrics", calculate_triaxial_iso_metrics(col("acc_x_series"), col("acc_y_series"), col("acc_z_series"))) \
         .select("*", "iso_metrics.*") \
-        .drop("iso_metrics", "acc_z_series")
+        .drop("iso_metrics", "acc_x_series", "acc_y_series", "acc_z_series")
 
-    # Dynamic Comfort Score (0-100%):
-    # Evaluates continuous vibration (weighted_acc_z) and transient shock (vdv_acc_z)
-    # Severe pothole shocks penalize comfort through VDV even if baseline RMS is low
+    # Dynamic Multi-Axial Comfort Score (0-100%):
+    # Evaluates total vibration av (vector sum of weighted vertical, lateral, longitudinal acceleration) and multi-axial VDV
     gold_metrics = gold_with_iso \
         .withColumn("comfort_score", 
-            expr("GREATEST(0.0, LEAST(100.0, 100.0 - (weighted_acc_z * 40.0 + vdv_acc_z * 12.0)))")) \
+            expr("GREATEST(0.0, LEAST(100.0, 100.0 - (total_acc_v * 35.0 + vdv_total * 10.0)))")) \
         .withColumn("road_holding_tier",
             expr("CASE WHEN min_tire_load < 0.15 THEN 'CRITICAL (Wheel Lift Hazard)' " +
                  "WHEN min_tire_load < 0.40 THEN 'MARGINAL (Tire Unloading)' " +
@@ -260,8 +284,9 @@ def main():
         col("window.start").alias("start_time"),
         col("window.end").alias("end_time"),
         "vehicle_id", "test_id", "rms_acc_z", "peak_acc_z", 
-        "avg_speed", "weighted_acc_z", "vdv_acc_z", "crest_factor",
-        "dominant_freq", "shock_event", "iso_comfort_tier", "comfort_score",
+        "avg_speed", "weighted_acc_z", "weighted_acc_x", "weighted_acc_y",
+        "total_acc_v", "vdv_total", "vdv_acc_z", "crest_factor_z",
+        "dominant_freq_z", "shock_event", "iso_comfort_tier", "comfort_score",
         "min_tire_load", "avg_tire_load", "road_holding_tier"
     ).withColumn("date", to_date(col("start_time"))) \
      .withColumn("year", year(col("start_time"))) \

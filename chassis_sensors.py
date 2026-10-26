@@ -79,6 +79,8 @@ AVRO_SCHEMA = """
     {"name": "test_id", "type": "string"},
     {"name": "timestamp", "type": "double"},
     {"name": "speed_kmh", "type": "double"},
+    {"name": "acc_x", "type": "double", "default": 0.0},
+    {"name": "acc_y", "type": "double", "default": 0.0},
     {"name": "acc_z", "type": "double"},
     {"name": "suspension_mm", "type": "double"},
     {"name": "pitch_deg", "type": "double"},
@@ -136,6 +138,8 @@ class VehiclePhysics:
         self.z_s = 0.0         # Sprung mass vertical displacement (m)
         self.v_s = 0.0         # Sprung mass vertical velocity (m/s)
         self.acc_z = 0.0       # Sprung mass vertical acceleration (m/s^2)
+        self.acc_x = 0.0       # Longitudinal acceleration (m/s^2)
+        self.acc_y = 0.0       # Lateral acceleration (m/s^2)
         
         self.z_u = 0.0         # Unsprung mass vertical displacement (m)
         self.v_u = 0.0         # Unsprung mass vertical velocity (m/s)
@@ -282,6 +286,16 @@ class VehiclePhysics:
         self.roll_deg += (target_roll - self.roll_deg) * dt * 3.0
         self.roll_deg = max(MIN_ROLL, min(MAX_ROLL, self.roll_deg))
 
+        # 6. Tri-Axial Accelerations for Full ISO 2631-1 Evaluation:
+        # acc_x (Longitudinal): Combination of vehicle drive/braking acceleration and pitch tilt gravity component
+        pitch_rad = math.radians(self.pitch_deg)
+        self.acc_x = float(round(self.long_acc + GRAVITY * math.sin(pitch_rad), 4))
+        
+        # acc_y (Lateral): Combination of cornering sway acceleration and roll tilt gravity component
+        roll_rad = math.radians(self.roll_deg)
+        lateral_sway = math.cos(self.roll_phase) * 0.8 * (v_ms / 25.0)
+        self.acc_y = float(round(lateral_sway + GRAVITY * math.sin(roll_rad), 4))
+
     def generate_message(self):
         """Formats the current state into an Avro-ready dictionary."""
         return {
@@ -289,6 +303,8 @@ class VehiclePhysics:
             "test_id": self.test_id,
             "timestamp": time.time(),
             "speed_kmh": float(round(self.speed_kmh, 2)),
+            "acc_x": float(round(self.acc_x, 4)),
+            "acc_y": float(round(self.acc_y, 4)),
             "acc_z": float(round(self.acc_z, 4)),
             "suspension_mm": float(round(self.suspension_mm, 2)),
             "pitch_deg": float(round(self.pitch_deg, 3)),
